@@ -1,0 +1,80 @@
+name: Deploy to GKE via Kubectl
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  DEPLOYMENT_NAME: my-app
+  KUBE_NAMESPACE: production
+
+jobs:
+  deploy:
+    name: Build, Push & Deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # Required for OIDC / Workload Identity Federation
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # 1. Authenticate to GCP via Workload Identity Federation
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      # 2. Set up gcloud CLI & Configure Docker Auth for Artifact Registry
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
+
+      # 3. Get GKE Credentials
+      - name: Get GKE Credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ vars.GKE_CLUSTER_NAME }}
+          location: ${{ vars.GCP_REGION }}
+
+      # 4. Build and Push Docker Image
+      - name: Build & Push Container Image
+        run: |
+          IMAGE_TAG="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.ARTIFACT_REPO }}/my-app:${{ github.sha }}"
+          
+          docker build -t $IMAGE_TAG .
+          docker push $IMAGE_TAG
+          
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+
+      # 5. Apply Kubernetes Manifests & Update Image
+      - name: Deploy to Kubernetes
+        run: |
+          echo "::group::Applying Kubernetes Manifests"
+          
+          # Create namespace if it doesn't exist
+          kubectl create namespace ${{ env.KUBE_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Apply manifest files (Ensure manifests are located in ./k8s directory)
+          kubectl apply -f ./k8s/ -n ${{ env.KUBE_NAMESPACE }}
+          
+          # Update deployment image tag
+          kubectl set image deployment/${{ env.DEPLOYMENT_NAME }} ${{ env.DEPLOYMENT_NAME }}=$IMAGE_TAG -n ${{ env.KUBE_NAMESPACE }}
+          
+          echo "::endgroup::"
+
+      # 6. Verify Rollout & Logs
+      - name: Verify Rollout
+        if: always()
+        run: |
+          echo "::group::GKE Deployment Overview"
+          kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }} -n ${{ env.KUBE_NAMESPACE }} --timeout=180s
+          kubectl get pods -n ${{ env.KUBE_NAMESPACE }} -l "app=${{ env.DEPLOYMENT_NAME }}" -o wide
+          echo "::endgroup::"
